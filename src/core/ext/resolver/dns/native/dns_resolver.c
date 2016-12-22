@@ -171,6 +171,7 @@ static void dns_on_resolved(grpc_exec_ctx *exec_ctx, void *arg,
   GPR_ASSERT(r->resolving);
   r->resolving = 0;
   grpc_resolved_addresses *addresses = r->addresses;
+
   if (addresses != NULL) {
     grpc_lb_policy_args lb_policy_args;
     config = grpc_client_config_create();
@@ -184,17 +185,31 @@ static void dns_on_resolved(grpc_exec_ctx *exec_ctx, void *arg,
       GRPC_LB_POLICY_UNREF(exec_ctx, lb_policy, "construction");
     }
     grpc_resolved_addresses_destroy(addresses);
+    if (!r->have_retry_timer) {
+      /* Set the timeout to its maximum value, since we did succeed. */
+      r->backoff_state.current_timeout_millis = BACKOFF_MAX_SECONDS * 1000L;
+      gpr_log(GPR_DEBUG, "Set timeout to %" PRId64 " millis", r->backoff_state.current_timeout_millis);
+    }
   } else {
+    const char *msg = grpc_error_string(error);
+    gpr_log(GPR_ERROR, "dns resolution failed: %s", msg);
+    grpc_error_free_string(msg);
+    if (r->have_retry_timer) {
+      /* if there is a pending timer, it's one of the periodic ones set on success.
+       * we'll cancel it here and set it again in a few lines. */
+      r->have_retry_timer = false;
+      grpc_timer_cancel(exec_ctx, &r->retry_timer);
+    }
+  }
+  /* If there is no timer set, set a new one to keep resolving. */
+  if (!r->have_retry_timer) {
     gpr_timespec now = gpr_now(GPR_CLOCK_MONOTONIC);
     gpr_timespec next_try = gpr_backoff_step(&r->backoff_state, now);
     gpr_timespec timeout = gpr_time_sub(next_try, now);
-    const char *msg = grpc_error_string(error);
-    gpr_log(GPR_DEBUG, "dns resolution failed: %s", msg);
-    grpc_error_free_string(msg);
     GPR_ASSERT(!r->have_retry_timer);
     r->have_retry_timer = true;
     GRPC_RESOLVER_REF(&r->base, "retry-timer");
-    if (gpr_time_cmp(timeout, gpr_time_0(timeout.clock_type)) <= 0) {
+    if (gpr_time_cmp(timeout, gpr_time_0(timeout.clock_type)) > 0) {
       gpr_log(GPR_DEBUG, "retrying in %" PRId64 ".%09d seconds", timeout.tv_sec,
               timeout.tv_nsec);
     } else {

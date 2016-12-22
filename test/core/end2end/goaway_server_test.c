@@ -126,13 +126,13 @@ int main(int argc, char **argv) {
 
   char *addr;
 
-  /* create a channel that picks first amongst the servers */
+  gpr_log(GPR_DEBUG, "-- a channel that picks first amongst the servers ");
   grpc_channel *chan = grpc_insecure_channel_create("test", NULL, NULL);
-  /* and an initial call to them */
+  gpr_log(GPR_DEBUG, "-- an initial call to them ");
   grpc_call *call1 = grpc_channel_create_call(
       chan, NULL, GRPC_PROPAGATE_DEFAULTS, cq, "/foo", "127.0.0.1",
       GRPC_TIMEOUT_SECONDS_TO_DEADLINE(20), NULL);
-  /* send initial metadata to probe connectivity */
+  gpr_log(GPR_DEBUG, "-- initial metadata to probe connectivity ");
   memset(ops, 0, sizeof(ops));
   op = ops;
   op->op = GRPC_OP_SEND_INITIAL_METADATA;
@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
   GPR_ASSERT(GRPC_CALL_OK == grpc_call_start_batch(call1, ops,
                                                    (size_t)(op - ops),
                                                    tag(0x101), NULL));
-  /* and receive status to probe termination */
+  gpr_log(GPR_DEBUG, "-- receive status to probe termination ");
   memset(ops, 0, sizeof(ops));
   op = ops;
   op->op = GRPC_OP_RECV_STATUS_ON_CLIENT;
@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
                                                    (size_t)(op - ops),
                                                    tag(0x102), NULL));
 
-  /* bring a server up on the first port */
+  gpr_log(GPR_DEBUG, "-- a server up on the first port ");
   grpc_server *server1 = grpc_server_create(NULL, NULL);
   gpr_asprintf(&addr, "127.0.0.1:%d", port1);
   grpc_server_add_insecure_http2_port(server1, addr);
@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
   gpr_free(addr);
   grpc_server_start(server1);
 
-  /* request a call to the server */
+  gpr_log(GPR_DEBUG, "-- a call to the server ");
   grpc_call *server_call1;
   GPR_ASSERT(GRPC_CALL_OK ==
              grpc_server_request_call(server1, &server_call1, &request_details1,
@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
 
   set_resolve_port(port1);
 
-  /* first call should now start */
+  gpr_log(GPR_DEBUG, "-- call should now start ");
   cq_expect_completion(cqv, tag(0x101), 1);
   cq_expect_completion(cqv, tag(0x301), 1);
   cq_verify(cqv);
@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
                                         gpr_inf_future(GPR_CLOCK_REALTIME), cq,
                                         tag(0x9999));
 
-  /* listen for close on the server call to probe for finishing */
+  gpr_log(GPR_DEBUG, "-- for close on the server call to probe for finishing ");
   memset(ops, 0, sizeof(ops));
   op = ops;
   op->op = GRPC_OP_RECV_CLOSE_ON_SERVER;
@@ -196,19 +196,18 @@ int main(int argc, char **argv) {
                                                    (size_t)(op - ops),
                                                    tag(0x302), NULL));
 
-  /* shutdown first server:
-   * we should see a connectivity change and then nothing */
+  gpr_log(GPR_DEBUG, "-- first server: * we should see a connectivity change and then nothing ");
   set_resolve_port(-1);
   grpc_server_shutdown_and_notify(server1, cq, tag(0xdead1));
   cq_expect_completion(cqv, tag(0x9999), 1);
   cq_verify(cqv);
   cq_verify_empty(cqv);
 
-  /* and a new call: should go through to server2 when we start it */
+  gpr_log(GPR_DEBUG, "-- a new call: should go through to server2 when we start it ");
   grpc_call *call2 = grpc_channel_create_call(
       chan, NULL, GRPC_PROPAGATE_DEFAULTS, cq, "/foo", "127.0.0.1",
       GRPC_TIMEOUT_SECONDS_TO_DEADLINE(20), NULL);
-  /* send initial metadata to probe connectivity */
+  gpr_log(GPR_DEBUG, "-- initial metadata to probe connectivity ");
   memset(ops, 0, sizeof(ops));
   op = ops;
   op->op = GRPC_OP_SEND_INITIAL_METADATA;
@@ -219,7 +218,7 @@ int main(int argc, char **argv) {
   GPR_ASSERT(GRPC_CALL_OK == grpc_call_start_batch(call2, ops,
                                                    (size_t)(op - ops),
                                                    tag(0x201), NULL));
-  /* and receive status to probe termination */
+  gpr_log(GPR_DEBUG, "-- receive status to probe termination ");
   memset(ops, 0, sizeof(ops));
   op = ops;
   op->op = GRPC_OP_RECV_STATUS_ON_CLIENT;
@@ -234,7 +233,7 @@ int main(int argc, char **argv) {
                                                    (size_t)(op - ops),
                                                    tag(0x202), NULL));
 
-  /* and bring up second server */
+  gpr_log(GPR_DEBUG, "-- bring up second server ");
   set_resolve_port(port2);
   grpc_server *server2 = grpc_server_create(NULL, NULL);
   gpr_asprintf(&addr, "127.0.0.1:%d", port2);
@@ -243,18 +242,18 @@ int main(int argc, char **argv) {
   gpr_free(addr);
   grpc_server_start(server2);
 
-  /* request a call to the server */
+  gpr_log(GPR_DEBUG, "-- a call to the server ");
   grpc_call *server_call2;
   GPR_ASSERT(GRPC_CALL_OK ==
              grpc_server_request_call(server2, &server_call2, &request_details2,
                                       &request_metadata2, cq, cq, tag(0x401)));
 
-  /* second call should now start */
+  gpr_log(GPR_DEBUG, "-- call should now start ");
   cq_expect_completion(cqv, tag(0x201), 1);
   cq_expect_completion(cqv, tag(0x401), 1);
   cq_verify(cqv);
 
-  /* listen for close on the server call to probe for finishing */
+  gpr_log(GPR_DEBUG, "-- for close on the server call to probe for finishing ");
   memset(ops, 0, sizeof(ops));
   op = ops;
   op->op = GRPC_OP_RECV_CLOSE_ON_SERVER;
@@ -265,14 +264,14 @@ int main(int argc, char **argv) {
                                                    (size_t)(op - ops),
                                                    tag(0x402), NULL));
 
-  /* shutdown second server: we should see nothing */
+  gpr_log(GPR_DEBUG, "-- second server: we should see nothing ");
   grpc_server_shutdown_and_notify(server2, cq, tag(0xdead2));
   cq_verify_empty(cqv);
 
   grpc_call_cancel(call1, NULL);
   grpc_call_cancel(call2, NULL);
 
-  /* now everything else should finish */
+  gpr_log(GPR_DEBUG, "-- everything else should finish ");
   cq_expect_completion(cqv, tag(0x102), 1);
   cq_expect_completion(cqv, tag(0x202), 1);
   cq_expect_completion(cqv, tag(0x302), 1);
