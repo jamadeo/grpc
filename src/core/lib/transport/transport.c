@@ -32,18 +32,25 @@
  */
 
 #include "src/core/lib/transport/transport.h"
+
+#include <string.h>
+
 #include <grpc/support/alloc.h>
 #include <grpc/support/atm.h>
 #include <grpc/support/log.h>
 #include <grpc/support/sync.h>
+
+#include "src/core/lib/slice/slice_internal.h"
+#include "src/core/lib/slice/slice_string_helpers.h"
 #include "src/core/lib/support/string.h"
 #include "src/core/lib/transport/transport_impl.h"
 
 #ifdef GRPC_STREAM_REFCOUNT_DEBUG
 void grpc_stream_ref(grpc_stream_refcount *refcount, const char *reason) {
   gpr_atm val = gpr_atm_no_barrier_load(&refcount->refs.count);
-  gpr_log(GPR_DEBUG, "%s %p:%p   REF %d->%d %s", refcount->object_type,
-          refcount, refcount->destroy.cb_arg, val, val + 1, reason);
+  gpr_log(GPR_DEBUG, "%s %p:%p   REF %" PRIdPTR "->%" PRIdPTR " %s",
+          refcount->object_type, refcount, refcount->destroy.cb_arg, val,
+          val + 1, reason);
 #else
 void grpc_stream_ref(grpc_stream_refcount *refcount) {
 #endif
@@ -54,14 +61,15 @@ void grpc_stream_ref(grpc_stream_refcount *refcount) {
 void grpc_stream_unref(grpc_exec_ctx *exec_ctx, grpc_stream_refcount *refcount,
                        const char *reason) {
   gpr_atm val = gpr_atm_no_barrier_load(&refcount->refs.count);
-  gpr_log(GPR_DEBUG, "%s %p:%p UNREF %d->%d %s", refcount->object_type,
-          refcount, refcount->destroy.cb_arg, val, val - 1, reason);
+  gpr_log(GPR_DEBUG, "%s %p:%p UNREF %" PRIdPTR "->%" PRIdPTR " %s",
+          refcount->object_type, refcount, refcount->destroy.cb_arg, val,
+          val - 1, reason);
 #else
 void grpc_stream_unref(grpc_exec_ctx *exec_ctx,
                        grpc_stream_refcount *refcount) {
 #endif
   if (gpr_unref(&refcount->refs)) {
-    grpc_exec_ctx_sched(exec_ctx, &refcount->destroy, GRPC_ERROR_NONE, NULL);
+    grpc_closure_sched(exec_ctx, &refcount->destroy, GRPC_ERROR_NONE);
   }
 }
 
@@ -75,7 +83,7 @@ void grpc_stream_ref_init(grpc_stream_refcount *refcount, int initial_refs,
                           grpc_iomgr_cb_func cb, void *cb_arg) {
 #endif
   gpr_ref_init(&refcount->refs, initial_refs);
-  grpc_closure_init(&refcount->destroy, cb, cb_arg);
+  grpc_closure_init(&refcount->destroy, cb, cb_arg, grpc_schedule_on_exec_ctx);
 }
 
 static void move64(uint64_t *from, uint64_t *to) {
@@ -153,14 +161,18 @@ char *grpc_transport_get_peer(grpc_exec_ctx *exec_ctx,
   return transport->vtable->get_peer(exec_ctx, transport);
 }
 
+grpc_endpoint *grpc_transport_get_endpoint(grpc_exec_ctx *exec_ctx,
+                                           grpc_transport *transport) {
+  return transport->vtable->get_endpoint(exec_ctx, transport);
+}
+
 void grpc_transport_stream_op_finish_with_failure(grpc_exec_ctx *exec_ctx,
                                                   grpc_transport_stream_op *op,
                                                   grpc_error *error) {
-  grpc_exec_ctx_sched(exec_ctx, op->recv_message_ready, GRPC_ERROR_REF(error),
-                      NULL);
-  grpc_exec_ctx_sched(exec_ctx, op->recv_initial_metadata_ready,
-                      GRPC_ERROR_REF(error), NULL);
-  grpc_exec_ctx_sched(exec_ctx, op->on_complete, error, NULL);
+  grpc_closure_sched(exec_ctx, op->recv_message_ready, GRPC_ERROR_REF(error));
+  grpc_closure_sched(exec_ctx, op->recv_initial_metadata_ready,
+                     GRPC_ERROR_REF(error));
+  grpc_closure_sched(exec_ctx, op->on_complete, error);
 }
 
 typedef struct {
@@ -184,7 +196,8 @@ static void add_error(grpc_transport_stream_op *op, grpc_error **which,
   cmd = gpr_malloc(sizeof(*cmd));
   cmd->error = error;
   cmd->then_call = op->on_complete;
-  grpc_closure_init(&cmd->closure, free_message, cmd);
+  grpc_closure_init(&cmd->closure, free_message, cmd,
+                    grpc_schedule_on_exec_ctx);
   op->on_complete = &cmd->closure;
   *which = error;
 }
@@ -200,50 +213,98 @@ void grpc_transport_stream_op_add_cancellation(grpc_transport_stream_op *op,
 }
 
 void grpc_transport_stream_op_add_cancellation_with_message(
-    grpc_transport_stream_op *op, grpc_status_code status,
-    gpr_slice *optional_message) {
+    grpc_exec_ctx *exec_ctx, grpc_transport_stream_op *op,
+    grpc_status_code status, grpc_slice *optional_message) {
   GPR_ASSERT(status != GRPC_STATUS_OK);
   if (op->cancel_error != GRPC_ERROR_NONE) {
     if (optional_message) {
-      gpr_slice_unref(*optional_message);
+      grpc_slice_unref_internal(exec_ctx, *optional_message);
     }
     return;
   }
   grpc_error *error;
   if (optional_message != NULL) {
-    char *msg = gpr_dump_slice(*optional_message, GPR_DUMP_ASCII);
+    char *msg = grpc_dump_slice(*optional_message, GPR_DUMP_ASCII);
     error = grpc_error_set_str(GRPC_ERROR_CREATE(msg),
                                GRPC_ERROR_STR_GRPC_MESSAGE, msg);
     gpr_free(msg);
-    gpr_slice_unref(*optional_message);
+    grpc_slice_unref_internal(exec_ctx, *optional_message);
   } else {
     error = GRPC_ERROR_CREATE("Call cancelled");
   }
   error = grpc_error_set_int(error, GRPC_ERROR_INT_GRPC_STATUS, status);
-  add_error(op, &op->close_error, error);
+  add_error(op, &op->cancel_error, error);
 }
 
-void grpc_transport_stream_op_add_close(grpc_transport_stream_op *op,
+void grpc_transport_stream_op_add_close(grpc_exec_ctx *exec_ctx,
+                                        grpc_transport_stream_op *op,
                                         grpc_status_code status,
-                                        gpr_slice *optional_message) {
+                                        grpc_slice *optional_message) {
   GPR_ASSERT(status != GRPC_STATUS_OK);
   if (op->cancel_error != GRPC_ERROR_NONE ||
       op->close_error != GRPC_ERROR_NONE) {
     if (optional_message) {
-      gpr_slice_unref(*optional_message);
+      grpc_slice_unref_internal(exec_ctx, *optional_message);
     }
     return;
   }
   grpc_error *error;
   if (optional_message != NULL) {
-    char *msg = gpr_dump_slice(*optional_message, GPR_DUMP_ASCII);
+    char *msg = grpc_dump_slice(*optional_message, GPR_DUMP_ASCII);
     error = grpc_error_set_str(GRPC_ERROR_CREATE(msg),
                                GRPC_ERROR_STR_GRPC_MESSAGE, msg);
     gpr_free(msg);
-    gpr_slice_unref(*optional_message);
+    grpc_slice_unref_internal(exec_ctx, *optional_message);
   } else {
     error = GRPC_ERROR_CREATE("Call force closed");
   }
   error = grpc_error_set_int(error, GRPC_ERROR_INT_GRPC_STATUS, status);
   add_error(op, &op->close_error, error);
+}
+
+typedef struct {
+  grpc_closure outer_on_complete;
+  grpc_closure *inner_on_complete;
+  grpc_transport_op op;
+} made_transport_op;
+
+static void destroy_made_transport_op(grpc_exec_ctx *exec_ctx, void *arg,
+                                      grpc_error *error) {
+  made_transport_op *op = arg;
+  grpc_closure_sched(exec_ctx, op->inner_on_complete, GRPC_ERROR_REF(error));
+  gpr_free(op);
+}
+
+grpc_transport_op *grpc_make_transport_op(grpc_closure *on_complete) {
+  made_transport_op *op = gpr_malloc(sizeof(*op));
+  grpc_closure_init(&op->outer_on_complete, destroy_made_transport_op, op,
+                    grpc_schedule_on_exec_ctx);
+  op->inner_on_complete = on_complete;
+  memset(&op->op, 0, sizeof(op->op));
+  op->op.on_consumed = &op->outer_on_complete;
+  return &op->op;
+}
+
+typedef struct {
+  grpc_closure outer_on_complete;
+  grpc_closure *inner_on_complete;
+  grpc_transport_stream_op op;
+} made_transport_stream_op;
+
+static void destroy_made_transport_stream_op(grpc_exec_ctx *exec_ctx, void *arg,
+                                             grpc_error *error) {
+  made_transport_stream_op *op = arg;
+  grpc_closure_sched(exec_ctx, op->inner_on_complete, GRPC_ERROR_REF(error));
+  gpr_free(op);
+}
+
+grpc_transport_stream_op *grpc_make_transport_stream_op(
+    grpc_closure *on_complete) {
+  made_transport_stream_op *op = gpr_malloc(sizeof(*op));
+  grpc_closure_init(&op->outer_on_complete, destroy_made_transport_stream_op,
+                    op, grpc_schedule_on_exec_ctx);
+  op->inner_on_complete = on_complete;
+  memset(&op->op, 0, sizeof(op->op));
+  op->op.on_complete = &op->outer_on_complete;
+  return &op->op;
 }

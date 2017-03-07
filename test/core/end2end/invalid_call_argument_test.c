@@ -116,8 +116,8 @@ static void prepare_test(int is_client) {
                                         &g_state.call_details,
                                         &g_state.server_initial_metadata_recv,
                                         g_state.cq, g_state.cq, tag(101)));
-    cq_expect_completion(g_state.cqv, tag(101), 1);
-    cq_expect_completion(g_state.cqv, tag(1), 1);
+    CQ_EXPECT_COMPLETION(g_state.cqv, tag(101), 1);
+    CQ_EXPECT_COMPLETION(g_state.cqv, tag(1), 1);
     cq_verify(g_state.cqv);
   }
 }
@@ -191,7 +191,7 @@ static void test_send_initial_metadata_more_than_once() {
   GPR_ASSERT(GRPC_CALL_OK == grpc_call_start_batch(g_state.call, g_state.ops,
                                                    (size_t)(op - g_state.ops),
                                                    tag(1), NULL));
-  cq_expect_completion(g_state.cqv, tag(1), 0);
+  CQ_EXPECT_COMPLETION(g_state.cqv, tag(1), 0);
   cq_verify(g_state.cqv);
 
   op = g_state.ops;
@@ -237,7 +237,7 @@ static void test_send_null_message() {
   op->reserved = NULL;
   op++;
   op->op = GRPC_OP_SEND_MESSAGE;
-  op->data.send_message = NULL;
+  op->data.send_message.send_message = NULL;
   op->flags = 0;
   op->reserved = NULL;
   op++;
@@ -251,7 +251,8 @@ static void test_send_messages_at_the_same_time() {
   gpr_log(GPR_INFO, "test_send_messages_at_the_same_time");
 
   grpc_op *op;
-  gpr_slice request_payload_slice = gpr_slice_from_copied_string("hello world");
+  grpc_slice request_payload_slice =
+      grpc_slice_from_copied_string("hello world");
   grpc_byte_buffer *request_payload =
       grpc_raw_byte_buffer_create(&request_payload_slice, 1);
   prepare_test(1);
@@ -262,12 +263,12 @@ static void test_send_messages_at_the_same_time() {
   op->reserved = NULL;
   op++;
   op->op = GRPC_OP_SEND_MESSAGE;
-  op->data.send_message = request_payload;
+  op->data.send_message.send_message = request_payload;
   op->flags = 0;
   op->reserved = NULL;
   op++;
   op->op = GRPC_OP_SEND_MESSAGE;
-  op->data.send_message = tag(2);
+  op->data.send_message.send_message = tag(2);
   op->flags = 0;
   op->reserved = NULL;
   op++;
@@ -305,18 +306,20 @@ static void test_receive_initial_metadata_twice_at_client() {
   prepare_test(1);
   op = g_state.ops;
   op->op = GRPC_OP_RECV_INITIAL_METADATA;
-  op->data.recv_initial_metadata = &g_state.initial_metadata_recv;
+  op->data.recv_initial_metadata.recv_initial_metadata =
+      &g_state.initial_metadata_recv;
   op->flags = 0;
   op->reserved = NULL;
   op++;
   GPR_ASSERT(GRPC_CALL_OK == grpc_call_start_batch(g_state.call, g_state.ops,
                                                    (size_t)(op - g_state.ops),
                                                    tag(1), NULL));
-  cq_expect_completion(g_state.cqv, tag(1), 0);
+  CQ_EXPECT_COMPLETION(g_state.cqv, tag(1), 0);
   cq_verify(g_state.cqv);
   op = g_state.ops;
   op->op = GRPC_OP_RECV_INITIAL_METADATA;
-  op->data.recv_initial_metadata = &g_state.initial_metadata_recv;
+  op->data.recv_initial_metadata.recv_initial_metadata =
+      &g_state.initial_metadata_recv;
   op->flags = 0;
   op->reserved = NULL;
   op++;
@@ -334,7 +337,7 @@ static void test_receive_message_with_invalid_flags() {
   prepare_test(1);
   op = g_state.ops;
   op->op = GRPC_OP_RECV_MESSAGE;
-  op->data.recv_message = &payload;
+  op->data.recv_message.recv_message = &payload;
   op->flags = 1;
   op->reserved = NULL;
   op++;
@@ -352,12 +355,12 @@ static void test_receive_two_messages_at_the_same_time() {
   prepare_test(1);
   op = g_state.ops;
   op->op = GRPC_OP_RECV_MESSAGE;
-  op->data.recv_message = &payload;
+  op->data.recv_message.recv_message = &payload;
   op->flags = 0;
   op->reserved = NULL;
   op++;
   op->op = GRPC_OP_RECV_MESSAGE;
-  op->data.recv_message = &payload;
+  op->data.recv_message.recv_message = &payload;
   op->flags = 0;
   op->reserved = NULL;
   op++;
@@ -405,7 +408,7 @@ static void test_recv_status_on_client_twice() {
   GPR_ASSERT(GRPC_CALL_OK == grpc_call_start_batch(g_state.call, g_state.ops,
                                                    (size_t)(op - g_state.ops),
                                                    tag(1), NULL));
-  cq_expect_completion(g_state.cqv, tag(1), 1);
+  CQ_EXPECT_COMPLETION(g_state.cqv, tag(1), 1);
   cq_verify(g_state.cqv);
 
   op = g_state.ops;
@@ -572,6 +575,29 @@ static void test_recv_close_on_server_twice() {
   cleanup_test();
 }
 
+static void test_invalid_initial_metadata_reserved_key() {
+  gpr_log(GPR_INFO, "test_invalid_initial_metadata_reserved_key");
+
+  grpc_metadata metadata;
+  metadata.key = ":start_with_colon";
+  metadata.value = "value";
+  metadata.value_length = 6;
+
+  grpc_op *op;
+  prepare_test(1);
+  op = g_state.ops;
+  op->op = GRPC_OP_SEND_INITIAL_METADATA;
+  op->data.send_initial_metadata.count = 1;
+  op->data.send_initial_metadata.metadata = &metadata;
+  op->flags = 0;
+  op->reserved = NULL;
+  op++;
+  GPR_ASSERT(GRPC_CALL_ERROR_INVALID_METADATA ==
+             grpc_call_start_batch(g_state.call, g_state.ops,
+                                   (size_t)(op - g_state.ops), tag(1), NULL));
+  cleanup_test();
+}
+
 int main(int argc, char **argv) {
   grpc_test_init(argc, argv);
   grpc_init();
@@ -594,6 +620,7 @@ int main(int argc, char **argv) {
   test_send_server_status_twice();
   test_recv_close_on_server_with_invalid_flags();
   test_recv_close_on_server_twice();
+  test_invalid_initial_metadata_reserved_key();
   grpc_shutdown();
 
   return 0;

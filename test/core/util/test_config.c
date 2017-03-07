@@ -33,15 +33,20 @@
 
 #include "test/core/util/test_config.h"
 
-#include <grpc/support/log.h>
-#include <grpc/support/port_platform.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include <grpc/support/alloc.h>
+#include <grpc/support/log.h>
+
+#include "src/core/lib/support/env.h"
 #include "src/core/lib/support/string.h"
 
 double g_fixture_slowdown_factor = 1.0;
+double g_poller_slowdown_factor = 1.0;
 
 #if GPR_GETPID_IN_UNISTD_H
 #include <unistd.h>
@@ -210,6 +215,16 @@ static void install_crash_handler() {
 #include <stdio.h>
 #include <string.h>
 
+#define SIGNAL_NAMES_LENGTH 32
+
+static const char *const signal_names[] = {
+    NULL,      "SIGHUP",  "SIGINT",    "SIGQUIT", "SIGILL",    "SIGTRAP",
+    "SIGABRT", "SIGBUS",  "SIGFPE",    "SIGKILL", "SIGUSR1",   "SIGSEGV",
+    "SIGUSR2", "SIGPIPE", "SIGALRM",   "SIGTERM", "SIGSTKFLT", "SIGCHLD",
+    "SIGCONT", "SIGSTOP", "SIGTSTP",   "SIGTTIN", "SIGTTOU",   "SIGURG",
+    "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH",  "SIGIO",
+    "SIGPWR",  "SIGSYS"};
+
 static char g_alt_stack[GPR_MAX(MINSIGSTKSZ, 65536)];
 
 #define MAX_FRAMES 32
@@ -235,7 +250,11 @@ static void crash_handler(int signum, siginfo_t *info, void *data) {
   int addrlen;
 
   output_string("\n\n\n*******************************\nCaught signal ");
-  output_num(signum);
+  if (signum > 0 && signum < SIGNAL_NAMES_LENGTH) {
+    output_string(signal_names[signum]);
+  } else {
+    output_num(signum);
+  }
   output_string("\n");
 
   addrlen = backtrace(addrlist, GPR_ARRAY_SIZE(addrlist));
@@ -275,9 +294,16 @@ static void install_crash_handler() {}
 
 void grpc_test_init(int argc, char **argv) {
   install_crash_handler();
-  gpr_log(GPR_DEBUG, "test slowdown: machine=%f build=%f total=%f",
+  { /* poll-cv poll strategy runs much more slowly than anything else */
+    char *s = gpr_getenv("GRPC_POLL_STRATEGY");
+    if (s != NULL && 0 == strcmp(s, "poll-cv")) {
+      g_poller_slowdown_factor = 5.0;
+    }
+    gpr_free(s);
+  }
+  gpr_log(GPR_DEBUG, "test slowdown: machine=%f build=%f poll=%f total=%f",
           (double)GRPC_TEST_SLOWDOWN_MACHINE_FACTOR,
-          (double)GRPC_TEST_SLOWDOWN_BUILD_FACTOR,
+          (double)GRPC_TEST_SLOWDOWN_BUILD_FACTOR, g_poller_slowdown_factor,
           (double)GRPC_TEST_SLOWDOWN_FACTOR);
   /* seed rng with pid, so we don't end up with the same random numbers as a
      concurrently running test binary */

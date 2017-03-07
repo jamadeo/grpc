@@ -69,8 +69,8 @@ PHP_GRPC_FREE_WRAPPED_FUNC_START(wrapped_grpc_call)
   }
 PHP_GRPC_FREE_WRAPPED_FUNC_END()
 
-/* Initializes an instance of wrapped_grpc_call to be associated with an object
- * of a class specified by class_type */
+/* Initializes an instance of wrapped_grpc_call to be associated with an
+ * object of a class specified by class_type */
 php_grpc_zend_object create_wrapped_grpc_call(zend_class_entry *class_type
                                               TSRMLS_DC) {
   PHP_GRPC_ALLOC_CLASS_OBJECT(wrapped_grpc_call);
@@ -195,10 +195,11 @@ zval *grpc_php_wrap_call(grpc_call *wrapped, bool owned TSRMLS_DC) {
 
 /**
  * Constructs a new instance of the Call class.
- * @param Channel $channel The channel to associate the call with. Must not be
- *     closed.
+ * @param Channel $channel_obj The channel to associate the call with.
+ *                             Must not be closed.
  * @param string $method The method to call
- * @param Timeval $absolute_deadline The deadline for completing the call
+ * @param Timeval $deadline_obj The deadline for completing the call
+ * @param string $host_override The host is set by user (optional)
  */
 PHP_METHOD(Call, __construct) {
   zval *channel_obj;
@@ -237,7 +238,7 @@ PHP_METHOD(Call, __construct) {
 
 /**
  * Start a batch of RPC actions.
- * @param array batch Array of actions to take
+ * @param array $array Array of actions to take
  * @return object Object with results of all actions
  */
 PHP_METHOD(Call, startBatch) {
@@ -334,7 +335,7 @@ PHP_METHOD(Call, startBatch) {
                              1 TSRMLS_CC);
         goto cleanup;
       }
-      ops[op_num].data.send_message =
+      ops[op_num].data.send_message.send_message =
           string_to_byte_buffer(Z_STRVAL_P(message_value),
                                 Z_STRLEN_P(message_value));
       break;
@@ -389,10 +390,11 @@ PHP_METHOD(Call, startBatch) {
       }
       break;
     case GRPC_OP_RECV_INITIAL_METADATA:
-      ops[op_num].data.recv_initial_metadata = &recv_metadata;
+      ops[op_num].data.recv_initial_metadata.recv_initial_metadata =
+          &recv_metadata;
       break;
     case GRPC_OP_RECV_MESSAGE:
-      ops[op_num].data.recv_message = &message;
+      ops[op_num].data.recv_message.recv_message = &message;
       break;
     case GRPC_OP_RECV_STATUS_ON_CLIENT:
       ops[op_num].data.recv_status_on_client.trailing_metadata =
@@ -477,6 +479,7 @@ PHP_METHOD(Call, startBatch) {
                                    true);
       add_property_zval(result, "status", recv_status);
       PHP_GRPC_DELREF(recv_status);
+      PHP_GRPC_FREE_STD_ZVAL(recv_status);
       break;
     case GRPC_OP_RECV_CLOSE_ON_SERVER:
       add_property_bool(result, "cancelled", cancelled);
@@ -496,10 +499,11 @@ cleanup:
   }
   for (int i = 0; i < op_num; i++) {
     if (ops[i].op == GRPC_OP_SEND_MESSAGE) {
-      grpc_byte_buffer_destroy(ops[i].data.send_message);
+      grpc_byte_buffer_destroy(ops[i].data.send_message.send_message);
     }
     if (ops[i].op == GRPC_OP_RECV_MESSAGE) {
       grpc_byte_buffer_destroy(message);
+      PHP_GRPC_FREE_STD_ZVAL(message_str);
     }
   }
   RETURN_DESTROY_ZVAL(result);
@@ -515,8 +519,9 @@ PHP_METHOD(Call, getPeer) {
 }
 
 /**
- * Cancel the call. This will cause the call to end with STATUS_CANCELLED if it
- * has not already ended with another status.
+ * Cancel the call. This will cause the call to end with STATUS_CANCELLED
+ * if it has not already ended with another status.
+ * @return void
  */
 PHP_METHOD(Call, cancel) {
   wrapped_grpc_call *call = Z_WRAPPED_GRPC_CALL_P(getThis());
@@ -525,8 +530,8 @@ PHP_METHOD(Call, cancel) {
 
 /**
  * Set the CallCredentials for this call.
- * @param CallCredentials creds_obj The CallCredentials object
- * @param int The error code
+ * @param CallCredentials $creds_obj The CallCredentials object
+ * @return int The error code
  */
 PHP_METHOD(Call, setCredentials) {
   zval *creds_obj;

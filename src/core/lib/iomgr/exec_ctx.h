@@ -40,10 +40,9 @@
 
 /** A workqueue represents a list of work to be executed asynchronously.
     Forward declared here to avoid a circular dependency with workqueue.h. */
-struct grpc_workqueue;
 typedef struct grpc_workqueue grpc_workqueue;
+typedef struct grpc_combiner grpc_combiner;
 
-#ifndef GRPC_EXECUTION_CONTEXT_SANITIZER
 /** Execution context.
  *  A bag of data that collects information along a callstack.
  *  Generally created at public API entry points, and passed down as
@@ -58,21 +57,28 @@ typedef struct grpc_workqueue grpc_workqueue;
  *    should actively try to finish up and get this thread back to its owner
  *
  *  CONVENTIONS:
- *  Instance of this must ALWAYS be constructed on the stack, never
- *  heap allocated. Instances and pointers to them must always be called
- *  exec_ctx. Instances are always passed as the first argument
- *  to a function that takes it, and always as a pointer (grpc_exec_ctx
- *  is never copied).
+ *  - Instance of this must ALWAYS be constructed on the stack, never
+ *    heap allocated.
+ *  - Instances and pointers to them must always be called exec_ctx.
+ *  - Instances are always passed as the first argument to a function that
+ *    takes it, and always as a pointer (grpc_exec_ctx is never copied).
  */
+#ifndef GRPC_EXECUTION_CONTEXT_SANITIZER
 struct grpc_exec_ctx {
   grpc_closure_list closure_list;
+  /** currently active combiner: updated only via combiner.c */
+  grpc_combiner *active_combiner;
+  /** last active combiner in the active combiner list */
+  grpc_combiner *last_combiner;
   bool cached_ready_to_finish;
   void *check_ready_to_finish_arg;
   bool (*check_ready_to_finish)(grpc_exec_ctx *exec_ctx, void *arg);
 };
 
+/* initializer for grpc_exec_ctx:
+   prefer to use GRPC_EXEC_CTX_INIT whenever possible */
 #define GRPC_EXEC_CTX_INIT_WITH_FINISH_CHECK(finish_check, finish_check_arg) \
-  { GRPC_CLOSURE_LIST_INIT, false, finish_check_arg, finish_check }
+  { GRPC_CLOSURE_LIST_INIT, NULL, NULL, false, finish_check_arg, finish_check }
 #else
 struct grpc_exec_ctx {
   bool cached_ready_to_finish;
@@ -83,8 +89,12 @@ struct grpc_exec_ctx {
   { false, finish_check_arg, finish_check }
 #endif
 
+/* initialize an execution context at the top level of an API call into grpc
+   (this is safe to use elsewhere, though possibly not as efficient) */
 #define GRPC_EXEC_CTX_INIT \
-  GRPC_EXEC_CTX_INIT_WITH_FINISH_CHECK(grpc_never_ready_to_finish, NULL)
+  GRPC_EXEC_CTX_INIT_WITH_FINISH_CHECK(grpc_always_ready_to_finish, NULL)
+
+extern grpc_closure_scheduler *grpc_schedule_on_exec_ctx;
 
 /** Flush any work that has been enqueued onto this grpc_exec_ctx.
  *  Caller must guarantee that no interfering locks are held.
@@ -93,14 +103,6 @@ bool grpc_exec_ctx_flush(grpc_exec_ctx *exec_ctx);
 /** Finish any pending work for a grpc_exec_ctx. Must be called before
  *  the instance is destroyed, or work may be lost. */
 void grpc_exec_ctx_finish(grpc_exec_ctx *exec_ctx);
-/** Add a closure to be executed in the future.
-    If \a offload_target_or_null is NULL, the closure will be executed at the
-    next exec_ctx.{finish,flush} point.
-    If \a offload_target_or_null is non-NULL, the closure will be scheduled
-    against the workqueue, and a reference to the workqueue will be consumed. */
-void grpc_exec_ctx_sched(grpc_exec_ctx *exec_ctx, grpc_closure *closure,
-                         grpc_error *error,
-                         grpc_workqueue *offload_target_or_null);
 /** Returns true if we'd like to leave this execution context as soon as
     possible: useful for deciding whether to do something more or not depending
     on outside context */
@@ -109,11 +111,6 @@ bool grpc_exec_ctx_ready_to_finish(grpc_exec_ctx *exec_ctx);
 bool grpc_never_ready_to_finish(grpc_exec_ctx *exec_ctx, void *arg_ignored);
 /** A finish check that is always ready to finish */
 bool grpc_always_ready_to_finish(grpc_exec_ctx *exec_ctx, void *arg_ignored);
-/** Add a list of closures to be executed at the next flush/finish point.
- *  Leaves \a list empty. */
-void grpc_exec_ctx_enqueue_list(grpc_exec_ctx *exec_ctx,
-                                grpc_closure_list *list,
-                                grpc_workqueue *offload_target_or_null);
 
 void grpc_exec_ctx_global_init(void);
 

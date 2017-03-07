@@ -43,8 +43,6 @@
 #include <grpc/support/useful.h>
 #include "test/core/end2end/cq_verifier.h"
 
-enum { TIMEOUT = 200000 };
-
 static void *tag(intptr_t t) { return (void *)t; }
 
 static gpr_timespec n_seconds_time(int n) {
@@ -108,8 +106,10 @@ static void simple_delayed_request_body(grpc_end2end_test_config config,
 
   config.init_client(f, client_args);
 
-  c = grpc_channel_create_call(f->client, NULL, GRPC_PROPAGATE_DEFAULTS, f->cq,
-                               "/foo", "foo.test.google.fr", deadline, NULL);
+  c = grpc_channel_create_call(
+      f->client, NULL, GRPC_PROPAGATE_DEFAULTS, f->cq, "/foo",
+      get_host_override_string("foo.test.google.fr:1234", config), deadline,
+      NULL);
   GPR_ASSERT(c);
 
   grpc_metadata_array_init(&initial_metadata_recv);
@@ -121,7 +121,7 @@ static void simple_delayed_request_body(grpc_end2end_test_config config,
   op = ops;
   op->op = GRPC_OP_SEND_INITIAL_METADATA;
   op->data.send_initial_metadata.count = 0;
-  op->flags = GRPC_INITIAL_METADATA_IGNORE_CONNECTIVITY;
+  op->flags = GRPC_INITIAL_METADATA_WAIT_FOR_READY;
   op->reserved = NULL;
   op++;
   op->op = GRPC_OP_SEND_CLOSE_FROM_CLIENT;
@@ -129,7 +129,7 @@ static void simple_delayed_request_body(grpc_end2end_test_config config,
   op->reserved = NULL;
   op++;
   op->op = GRPC_OP_RECV_INITIAL_METADATA;
-  op->data.recv_initial_metadata = &initial_metadata_recv;
+  op->data.recv_initial_metadata.recv_initial_metadata = &initial_metadata_recv;
   op->flags = 0;
   op->reserved = NULL;
   op++;
@@ -150,7 +150,7 @@ static void simple_delayed_request_body(grpc_end2end_test_config config,
       grpc_server_request_call(f->server, &s, &call_details,
                                &request_metadata_recv, f->cq, f->cq, tag(101));
   GPR_ASSERT(GRPC_CALL_OK == error);
-  cq_expect_completion(cqv, tag(101), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(101), 1);
   cq_verify(cqv);
 
   memset(ops, 0, sizeof(ops));
@@ -175,14 +175,15 @@ static void simple_delayed_request_body(grpc_end2end_test_config config,
   error = grpc_call_start_batch(s, ops, (size_t)(op - ops), tag(102), NULL);
   GPR_ASSERT(GRPC_CALL_OK == error);
 
-  cq_expect_completion(cqv, tag(102), 1);
-  cq_expect_completion(cqv, tag(1), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(102), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(1), 1);
   cq_verify(cqv);
 
   GPR_ASSERT(status == GRPC_STATUS_UNIMPLEMENTED);
   GPR_ASSERT(0 == strcmp(details, "xyz"));
   GPR_ASSERT(0 == strcmp(call_details.method, "/foo"));
-  GPR_ASSERT(0 == strcmp(call_details.host, "foo.test.google.fr"));
+  validate_host_override_string("foo.test.google.fr:1234", call_details.host,
+                                config);
   GPR_ASSERT(was_cancelled == 1);
 
   gpr_free(details);
@@ -199,21 +200,36 @@ static void simple_delayed_request_body(grpc_end2end_test_config config,
 
 static void test_simple_delayed_request_short(grpc_end2end_test_config config) {
   grpc_end2end_test_fixture f;
+  grpc_channel_args client_args;
+  grpc_arg arg_array[1];
+  arg_array[0].type = GRPC_ARG_INTEGER;
+  arg_array[0].key = "grpc.testing.fixed_reconnect_backoff_ms";
+  arg_array[0].value.integer = 1000;
+  client_args.args = arg_array;
+  client_args.num_args = 1;
 
   gpr_log(GPR_INFO, "%s/%s", "test_simple_delayed_request_short", config.name);
   f = config.create_fixture(NULL, NULL);
-  simple_delayed_request_body(config, &f, NULL, NULL, 100000);
+
+  simple_delayed_request_body(config, &f, &client_args, NULL, 100000);
   end_test(&f);
   config.tear_down_data(&f);
 }
 
 static void test_simple_delayed_request_long(grpc_end2end_test_config config) {
   grpc_end2end_test_fixture f;
+  grpc_channel_args client_args;
+  grpc_arg arg_array[1];
+  arg_array[0].type = GRPC_ARG_INTEGER;
+  arg_array[0].key = "grpc.testing.fixed_reconnect_backoff_ms";
+  arg_array[0].value.integer = 1000;
+  client_args.args = arg_array;
+  client_args.num_args = 1;
 
   gpr_log(GPR_INFO, "%s/%s", "test_simple_delayed_request_long", config.name);
   f = config.create_fixture(NULL, NULL);
   /* This timeout should be longer than a single retry */
-  simple_delayed_request_body(config, &f, NULL, NULL, 1500000);
+  simple_delayed_request_body(config, &f, &client_args, NULL, 1500000);
   end_test(&f);
   config.tear_down_data(&f);
 }

@@ -32,6 +32,9 @@
   FROM golang:1.5
   
   <%include file="../../go_path.include"/>
+  <%include file="../../python_deps.include"/>
+  RUN pip install twisted h2
+
   # Define the default command.
   CMD ["bash"]
   

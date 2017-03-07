@@ -34,7 +34,7 @@ import re
 import sys
 
 root = os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]), '../../..'))
-with open(os.path.join(root, 'tools', 'run_tests', 'sources_and_headers.json')) as f:
+with open(os.path.join(root, 'tools', 'run_tests', 'generated', 'sources_and_headers.json')) as f:
   js = json.loads(f.read())
 
 re_inc1 = re.compile(r'^#\s*include\s*"([^"]*)"')
@@ -55,7 +55,8 @@ def target_has_header(target, name):
   for dep in target['deps']:
     if target_has_header(get_target(dep), name):
       return True
-  if name == 'src/core/lib/profiling/stap_probes.h':
+  if name in ['src/core/lib/profiling/stap_probes.h',
+              'src/proto/grpc/reflection/v1alpha/reflection.grpc.pb.h']:
     return True
   return False
 

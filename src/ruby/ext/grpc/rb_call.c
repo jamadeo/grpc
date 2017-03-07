@@ -38,6 +38,7 @@
 
 #include <grpc/grpc.h>
 #include <grpc/support/alloc.h>
+#include <grpc/impl/codegen/compression_types.h>
 
 #include "rb_byte_buffer.h"
 #include "rb_call_credentials.h"
@@ -640,7 +641,7 @@ static void grpc_run_batch_stack_cleanup(run_batch_stack *st) {
 
   for (i = 0; i < st->op_num; i++) {
     if (st->ops[i].op == GRPC_OP_SEND_MESSAGE) {
-      grpc_byte_buffer_destroy(st->ops[i].data.send_message);
+      grpc_byte_buffer_destroy(st->ops[i].data.send_message.send_message);
     }
   }
 }
@@ -672,8 +673,9 @@ static void grpc_run_batch_stack_fill_ops(run_batch_stack *st, VALUE ops_hash) {
             st->send_metadata.metadata;
         break;
       case GRPC_OP_SEND_MESSAGE:
-        st->ops[st->op_num].data.send_message = grpc_rb_s_to_byte_buffer(
-            RSTRING_PTR(this_value), RSTRING_LEN(this_value));
+        st->ops[st->op_num].data.send_message.send_message =
+            grpc_rb_s_to_byte_buffer(RSTRING_PTR(this_value),
+                                     RSTRING_LEN(this_value));
         st->ops[st->op_num].flags = st->write_flag;
         break;
       case GRPC_OP_SEND_CLOSE_FROM_CLIENT:
@@ -685,10 +687,11 @@ static void grpc_run_batch_stack_fill_ops(run_batch_stack *st, VALUE ops_hash) {
             &st->ops[st->op_num], &st->send_trailing_metadata, this_value);
         break;
       case GRPC_OP_RECV_INITIAL_METADATA:
-        st->ops[st->op_num].data.recv_initial_metadata = &st->recv_metadata;
+        st->ops[st->op_num].data.recv_initial_metadata.recv_initial_metadata =
+            &st->recv_metadata;
         break;
       case GRPC_OP_RECV_MESSAGE:
-        st->ops[st->op_num].data.recv_message = &st->recv_message;
+        st->ops[st->op_num].data.recv_message.recv_message = &st->recv_message;
         break;
       case GRPC_OP_RECV_STATUS_ON_CLIENT:
         st->ops[st->op_num].data.recv_status_on_client.trailing_metadata =
@@ -910,6 +913,12 @@ static void Init_grpc_op_codes() {
                   UINT2NUM(GRPC_OP_RECV_CLOSE_ON_SERVER));
 }
 
+static void Init_grpc_metadata_keys() {
+  VALUE grpc_rb_mMetadataKeys = rb_define_module_under(grpc_rb_mGrpcCore, "MetadataKeys");
+  rb_define_const(grpc_rb_mMetadataKeys, "COMPRESSION_REQUEST_ALGORITHM",
+                  rb_str_new2(GRPC_COMPRESSION_REQUEST_ALGORITHM_MD_KEY));
+}
+
 void Init_grpc_call() {
   /* CallError inherits from Exception to signal that it is non-recoverable */
   grpc_rb_eCallError =
@@ -972,6 +981,7 @@ void Init_grpc_call() {
   Init_grpc_error_codes();
   Init_grpc_op_codes();
   Init_grpc_write_flags();
+  Init_grpc_metadata_keys();
 }
 
 /* Gets the call from the ruby object */

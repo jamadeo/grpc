@@ -31,6 +31,12 @@
  *
  */
 
+/* With the addition of a libuv endpoint, sockaddr.h now includes uv.h when
+   using that endpoint. Because of various transitive includes in uv.h,
+   including windows.h on Windows, uv.h must be included before other system
+   headers. Therefore, sockaddr.h must always be included first */
+#include "src/core/lib/iomgr/sockaddr.h"
+
 #include <grpc/grpc.h>
 #include <grpc/support/alloc.h>
 #include <grpc/support/log.h>
@@ -126,9 +132,17 @@ int main(int argc, char **argv) {
 
   char *addr;
 
-  gpr_log(GPR_DEBUG, "-- a channel that picks first amongst the servers ");
-  grpc_channel *chan = grpc_insecure_channel_create("test", NULL, NULL);
-  gpr_log(GPR_DEBUG, "-- an initial call to them ");
+  grpc_channel_args client_args;
+  grpc_arg arg_array[1];
+  arg_array[0].type = GRPC_ARG_INTEGER;
+  arg_array[0].key = "grpc.testing.fixed_reconnect_backoff_ms";
+  arg_array[0].value.integer = 1000;
+  client_args.args = arg_array;
+  client_args.num_args = 1;
+
+  /* create a channel that picks first amongst the servers */
+  grpc_channel *chan = grpc_insecure_channel_create("test", &client_args, NULL);
+  /* and an initial call to them */
   grpc_call *call1 = grpc_channel_create_call(
       chan, NULL, GRPC_PROPAGATE_DEFAULTS, cq, "/foo", "127.0.0.1",
       GRPC_TIMEOUT_SECONDS_TO_DEADLINE(20), NULL);
@@ -174,9 +188,9 @@ int main(int argc, char **argv) {
 
   set_resolve_port(port1);
 
-  gpr_log(GPR_DEBUG, "-- call should now start ");
-  cq_expect_completion(cqv, tag(0x101), 1);
-  cq_expect_completion(cqv, tag(0x301), 1);
+  /* first call should now start */
+  CQ_EXPECT_COMPLETION(cqv, tag(0x101), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0x301), 1);
   cq_verify(cqv);
 
   GPR_ASSERT(GRPC_CHANNEL_READY ==
@@ -199,7 +213,7 @@ int main(int argc, char **argv) {
   gpr_log(GPR_DEBUG, "-- first server: * we should see a connectivity change and then nothing ");
   set_resolve_port(-1);
   grpc_server_shutdown_and_notify(server1, cq, tag(0xdead1));
-  cq_expect_completion(cqv, tag(0x9999), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0x9999), 1);
   cq_verify(cqv);
   cq_verify_empty(cqv);
 
@@ -248,9 +262,9 @@ int main(int argc, char **argv) {
              grpc_server_request_call(server2, &server_call2, &request_details2,
                                       &request_metadata2, cq, cq, tag(0x401)));
 
-  gpr_log(GPR_DEBUG, "-- call should now start ");
-  cq_expect_completion(cqv, tag(0x201), 1);
-  cq_expect_completion(cqv, tag(0x401), 1);
+  /* second call should now start */
+  CQ_EXPECT_COMPLETION(cqv, tag(0x201), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0x401), 1);
   cq_verify(cqv);
 
   gpr_log(GPR_DEBUG, "-- for close on the server call to probe for finishing ");
@@ -271,13 +285,13 @@ int main(int argc, char **argv) {
   grpc_call_cancel(call1, NULL);
   grpc_call_cancel(call2, NULL);
 
-  gpr_log(GPR_DEBUG, "-- everything else should finish ");
-  cq_expect_completion(cqv, tag(0x102), 1);
-  cq_expect_completion(cqv, tag(0x202), 1);
-  cq_expect_completion(cqv, tag(0x302), 1);
-  cq_expect_completion(cqv, tag(0x402), 1);
-  cq_expect_completion(cqv, tag(0xdead1), 1);
-  cq_expect_completion(cqv, tag(0xdead2), 1);
+  /* now everything else should finish */
+  CQ_EXPECT_COMPLETION(cqv, tag(0x102), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0x202), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0x302), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0x402), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0xdead1), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(0xdead2), 1);
   cq_verify(cqv);
 
   grpc_call_destroy(call1);

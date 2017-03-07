@@ -64,16 +64,24 @@
 @implementation GRPCOpSendMetadata
 
 - (instancetype)init {
-  return [self initWithMetadata:nil handler:nil];
+  return [self initWithMetadata:nil flags:0 handler:nil];
 }
 
-- (instancetype)initWithMetadata:(NSDictionary *)metadata handler:(void (^)())handler {
+- (instancetype)initWithMetadata:(NSDictionary *)metadata
+                         handler:(void (^)())handler {
+  return [self initWithMetadata:metadata flags:0 handler:handler];
+}
+
+- (instancetype)initWithMetadata:(NSDictionary *)metadata
+                           flags:(uint32_t)flags
+                         handler:(void (^)())handler {
   if (self = [super init]) {
     _op.op = GRPC_OP_SEND_INITIAL_METADATA;
     _op.data.send_initial_metadata.count = metadata.count;
     _op.data.send_initial_metadata.metadata = metadata.grpc_metadataArray;
     _op.data.send_initial_metadata.maybe_compression_level.is_set = false;
     _op.data.send_initial_metadata.maybe_compression_level.level = 0;
+    _op.flags = flags;
     _handler = handler;
   }
   return self;
@@ -97,14 +105,14 @@
   }
   if (self = [super init]) {
     _op.op = GRPC_OP_SEND_MESSAGE;
-    _op.data.send_message = message.grpc_byteBuffer;
+    _op.data.send_message.send_message = message.grpc_byteBuffer;
     _handler = handler;
   }
   return self;
 }
 
 - (void)dealloc {
-  gpr_free(_op.data.send_message);
+  grpc_byte_buffer_destroy(_op.data.send_message.send_message);
 }
 
 @end
@@ -137,7 +145,7 @@
   if (self = [super init]) {
     _op.op = GRPC_OP_RECV_INITIAL_METADATA;
     grpc_metadata_array_init(&_headers);
-    _op.data.recv_initial_metadata = &_headers;
+    _op.data.recv_initial_metadata.recv_initial_metadata = &_headers;
     if (handler) {
       // Prevent reference cycle with _handler
       __weak typeof(self) weakSelf = self;
@@ -169,7 +177,7 @@
 - (instancetype)initWithHandler:(void (^)(grpc_byte_buffer *))handler {
   if (self = [super init]) {
     _op.op = GRPC_OP_RECV_MESSAGE;
-    _op.data.recv_message = &_receivedMessage;
+    _op.data.recv_message.recv_message = &_receivedMessage;
     if (handler) {
       // Prevent reference cycle with _handler
       __weak typeof(self) weakSelf = self;

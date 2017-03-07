@@ -30,6 +30,8 @@
 
 """Run tests in parallel."""
 
+from __future__ import print_function
+
 import argparse
 import ast
 import collections
@@ -49,12 +51,12 @@ import sys
 import tempfile
 import traceback
 import time
-import urllib2
+from six.moves import urllib
 import uuid
 
-import jobset
-import report_utils
-import watch_dirs
+import python_utils.jobset as jobset
+import python_utils.report_utils as report_utils
+import python_utils.watch_dirs as watch_dirs
 
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]), '../..'))
@@ -67,7 +69,7 @@ _FORCE_ENVIRON_FOR_WRAPPERS = {
 
 
 _POLLING_STRATEGIES = {
-  'linux': ['epoll', 'poll', 'legacy']
+  'linux': ['epoll', 'poll', 'poll-cv']
 }
 
 
@@ -81,7 +83,7 @@ _DEFAULT_TIMEOUT_SECONDS = 5 * 60
 # SimpleConfig: just compile with CONFIG=config, and run the binary to test
 class Config(object):
 
-  def __init__(self, config, environ=None, timeout_multiplier=1, tool_prefix=[]):
+  def __init__(self, config, environ=None, timeout_multiplier=1, tool_prefix=[], iomgr_platform='native'):
     if environ is None:
       environ = {}
     self.build_config = config
@@ -89,6 +91,7 @@ class Config(object):
     self.environ['CONFIG'] = config
     self.tool_prefix = tool_prefix
     self.timeout_multiplier = timeout_multiplier
+    self.iomgr_platform = iomgr_platform
 
   def job_spec(self, cmdline, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                shortname=None, environ={}, cpu_cost=1.0, flaky=False):
@@ -99,7 +102,7 @@ class Config(object):
                        would like to run
     """
     actual_environ = self.environ.copy()
-    for k, v in environ.iteritems():
+    for k, v in environ.items():
       actual_environ[k] = v
     return jobset.JobSpec(cmdline=self.tool_prefix + cmdline,
                           shortname=shortname,
@@ -113,7 +116,7 @@ class Config(object):
 def get_c_tests(travis, test_lang) :
   out = []
   platforms_str = 'ci_platforms' if travis else 'platforms'
-  with open('tools/run_tests/tests.json') as f:
+  with open('tools/run_tests/generated/tests.json') as f:
     js = json.load(f)
     return [tgt
             for tgt in js
@@ -137,6 +140,53 @@ def _is_use_docker_child():
   return True if os.getenv('RUN_TESTS_COMMAND') else False
 
 
+_PythonConfigVars = collections.namedtuple(
+  '_ConfigVars', ['shell', 'builder', 'builder_prefix_arguments',
+                  'venv_relative_python', 'toolchain', 'runner'])
+
+
+def _python_config_generator(name, major, minor, bits, config_vars):
+  return PythonConfig(
+    name,
+    config_vars.shell + config_vars.builder + config_vars.builder_prefix_arguments + [
+      _python_pattern_function(major=major, minor=minor, bits=bits)] + [
+      name] + config_vars.venv_relative_python + config_vars.toolchain,
+    config_vars.shell + config_vars.runner + [
+      os.path.join(name, config_vars.venv_relative_python[0])])
+
+
+def _pypy_config_generator(name, major, config_vars):
+  return PythonConfig(
+    name,
+    config_vars.shell + config_vars.builder + config_vars.builder_prefix_arguments + [
+      _pypy_pattern_function(major=major)] + [
+      name] + config_vars.venv_relative_python + config_vars.toolchain,
+    config_vars.shell + config_vars.runner + [
+      os.path.join(name, config_vars.venv_relative_python[0])])
+
+
+def _python_pattern_function(major, minor, bits):
+  # Bit-ness is handled by the test machine's environment
+  if os.name == "nt":
+    if bits == "64":
+      return '/c/Python{major}{minor}/python.exe'.format(
+        major=major, minor=minor, bits=bits)
+    else:
+      return '/c/Python{major}{minor}_{bits}bits/python.exe'.format(
+        major=major, minor=minor, bits=bits)
+  else:
+    return 'python{major}.{minor}'.format(major=major, minor=minor)
+
+
+def _pypy_pattern_function(major):
+  if major == '2':
+    return 'pypy'
+  elif major == '3':
+    return 'pypy3'
+  else:
+    raise ValueError("Unknown PyPy major version")
+
+
 class CLanguage(object):
 
   def __init__(self, make_target, test_lang):
@@ -153,6 +203,18 @@ class CLanguage(object):
     else:
       self._docker_distro, self._make_options = self._compiler_options(self.args.use_docker,
                                                                        self.args.compiler)
+    if args.iomgr_platform == "uv":
+      cflags = '-DGRPC_UV '
+      try:
+        cflags += subprocess.check_output(['pkg-config', '--cflags', 'libuv']).strip() + ' '
+      except (subprocess.CalledProcessError, OSError):
+        pass
+      try:
+        ldflags = subprocess.check_output(['pkg-config', '--libs', 'libuv']).strip() + ' '
+      except (subprocess.CalledProcessError, OSError):
+        ldflags = '-luv '
+      self._make_options += ['EXTRA_CPPFLAGS={}'.format(cflags),
+                             'EXTRA_LDLIBS={}'.format(ldflags)]
 
   def test_specs(self):
     out = []
@@ -161,13 +223,20 @@ class CLanguage(object):
       polling_strategies = (_POLLING_STRATEGIES.get(self.platform, ['all'])
                             if target.get('uses_polling', True)
                             else ['all'])
+      if self.args.iomgr_platform == 'uv':
+        polling_strategies = ['all']
       for polling_strategy in polling_strategies:
         env={'GRPC_DEFAULT_SSL_ROOTS_FILE_PATH':
                  _ROOT + '/src/core/lib/tsi/test_creds/ca.pem',
              'GRPC_POLL_STRATEGY': polling_strategy,
              'GRPC_VERBOSITY': 'DEBUG'}
         shortname_ext = '' if polling_strategy=='all' else ' GRPC_POLL_STRATEGY=%s' % polling_strategy
+        timeout_scaling = 1
+        if polling_strategy == 'poll-cv':
+          timeout_scaling *= 5
         if self.config.build_config in target['exclude_configs']:
+          continue
+        if self.args.iomgr_platform in target.get('exclude_iomgrs', []):
           continue
         if self.platform == 'windows':
           binary = 'vsprojects/%s%s/%s.exe' % (
@@ -176,6 +245,9 @@ class CLanguage(object):
               target['name'])
         else:
           binary = 'bins/%s/%s' % (self.config.build_config, target['name'])
+        cpu_cost = target['cpu_cost']
+        if cpu_cost == 'capacity':
+          cpu_cost = multiprocessing.cpu_count()
         if os.path.isfile(binary):
           if 'gtest' in target and target['gtest']:
             # here we parse the output of --gtest_list_tests to build up a
@@ -199,7 +271,8 @@ class CLanguage(object):
                 cmdline = [binary] + ['--gtest_filter=%s' % test]
                 out.append(self.config.job_spec(cmdline,
                                                 shortname='%s --gtest_filter=%s %s' % (binary, test, shortname_ext),
-                                                cpu_cost=target['cpu_cost'],
+                                                cpu_cost=cpu_cost,
+                                                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS * timeout_scaling,
                                                 environ=env))
           else:
             cmdline = [binary] + target['args']
@@ -208,12 +281,12 @@ class CLanguage(object):
                                                           pipes.quote(arg)
                                                           for arg in cmdline) +
                                                       shortname_ext,
-                                            cpu_cost=target['cpu_cost'],
+                                            cpu_cost=cpu_cost,
                                             flaky=target.get('flaky', False),
-                                            timeout_seconds=target.get('timeout_seconds', _DEFAULT_TIMEOUT_SECONDS),
+                                            timeout_seconds=target.get('timeout_seconds', _DEFAULT_TIMEOUT_SECONDS) * timeout_scaling,
                                             environ=env))
         elif self.args.regex == '.*' or self.platform == 'windows':
-          print '\nWARNING: binary not found, skipping', binary
+          print('\nWARNING: binary not found, skipping', binary)
     return sorted(out)
 
   def make_targets(self):
@@ -227,7 +300,7 @@ class CLanguage(object):
 
   def pre_build_steps(self):
     if self.platform == 'windows':
-      return [['tools\\run_tests\\pre_build_c.bat']]
+      return [['tools\\run_tests\\helper_scripts\\pre_build_c.bat']]
     else:
       return []
 
@@ -238,7 +311,7 @@ class CLanguage(object):
     if self.platform == 'windows':
       return []
     else:
-      return [['tools/run_tests/post_tests_c.sh']]
+      return [['tools/run_tests/helper_scripts/post_tests_c.sh']]
 
   def makefile_name(self):
     return 'Makefile'
@@ -266,6 +339,8 @@ class CLanguage(object):
       return ('wheezy', self._gcc_make_options(version_suffix='-4.4'))
     elif compiler == 'gcc4.6':
       return ('wheezy', self._gcc_make_options(version_suffix='-4.6'))
+    elif compiler == 'gcc4.8':
+      return ('jessie', self._gcc_make_options(version_suffix='-4.8'))
     elif compiler == 'gcc5.3':
       return ('ubuntu1604', [])
     elif compiler == 'clang3.4':
@@ -296,28 +371,48 @@ class NodeLanguage(object):
   def configure(self, config, args):
     self.config = config
     self.args = args
+    # Note: electron ABI only depends on major and minor version, so that's all
+    # we should specify in the compiler argument
     _check_compiler(self.args.compiler, ['default', 'node0.12',
                                          'node4', 'node5', 'node6',
-                                         'node7'])
-    if self.args.compiler == 'default':
-      self.node_version = '4'
+                                         'node7', 'electron1.3'])
+    if args.iomgr_platform == "uv":
+      self.use_uv = True
     else:
-      # Take off the word "node"
-      self.node_version = self.args.compiler[4:]
+      self.use_uv = False
+    if self.args.compiler == 'default':
+      self.runtime = 'node'
+      self.node_version = '7'
+    else:
+      if self.args.compiler.startswith('electron'):
+        self.runtime = 'electron'
+        self.node_version = self.args.compiler[8:]
+      else:
+        self.runtime = 'node'
+        # Take off the word "node"
+        self.node_version = self.args.compiler[4:]
 
   def test_specs(self):
     if self.platform == 'windows':
-      return [self.config.job_spec(['tools\\run_tests\\run_node.bat'], None)]
+      return [self.config.job_spec(['tools\\run_tests\\helper_scripts\\run_node.bat'])]
     else:
-      return [self.config.job_spec(['tools/run_tests/run_node.sh', self.node_version],
+      run_script = 'run_node'
+      if self.runtime == 'electron':
+        run_script += '_electron'
+      return [self.config.job_spec(['tools/run_tests/helper_scripts/{}.sh'.format(run_script),
+                                    self.node_version],
                                    None,
                                    environ=_FORCE_ENVIRON_FOR_WRAPPERS)]
 
   def pre_build_steps(self):
     if self.platform == 'windows':
-      return [['tools\\run_tests\\pre_build_node.bat']]
+      return [['tools\\run_tests\\helper_scripts\\pre_build_node.bat']]
     else:
-      return [['tools/run_tests/pre_build_node.sh', self.node_version]]
+      build_script = 'pre_build_node'
+      if self.runtime == 'electron':
+        build_script += '_electron'
+      return [['tools/run_tests/helper_scripts/{}.sh'.format(build_script),
+               self.node_version]]
 
   def make_targets(self):
     return []
@@ -327,9 +422,22 @@ class NodeLanguage(object):
 
   def build_steps(self):
     if self.platform == 'windows':
-      return [['tools\\run_tests\\build_node.bat']]
+      if self.config == 'dbg':
+        config_flag = '--debug'
+      else:
+        config_flag = '--release'
+      return [['tools\\run_tests\\helper_scripts\\build_node.bat',
+               '--grpc_uv={}'.format('true' if self.use_uv else 'false'),
+               config_flag]]
     else:
-      return [['tools/run_tests/build_node.sh', self.node_version]]
+      build_script = 'build_node'
+      if self.runtime == 'electron':
+        build_script += '_electron'
+        # building for electron requires a patch version
+        self.node_version += '.0'
+      return [['tools/run_tests/helper_scripts/{}.sh'.format(build_script),
+               self.node_version,
+               '--grpc_uv={}'.format('true' if self.use_uv else 'false')]]
 
   def post_tests_steps(self):
     return []
@@ -352,7 +460,7 @@ class PhpLanguage(object):
     _check_compiler(self.args.compiler, ['default'])
 
   def test_specs(self):
-    return [self.config.job_spec(['src/php/bin/run_tests.sh'], None,
+    return [self.config.job_spec(['src/php/bin/run_tests.sh'],
                                   environ=_FORCE_ENVIRON_FOR_WRAPPERS)]
 
   def pre_build_steps(self):
@@ -365,10 +473,10 @@ class PhpLanguage(object):
     return []
 
   def build_steps(self):
-    return [['tools/run_tests/build_php.sh']]
+    return [['tools/run_tests/helper_scripts/build_php.sh']]
 
   def post_tests_steps(self):
-    return [['tools/run_tests/post_tests_php.sh']]
+    return [['tools/run_tests/helper_scripts/post_tests_php.sh']]
 
   def makefile_name(self):
     return 'Makefile'
@@ -388,7 +496,7 @@ class Php7Language(object):
     _check_compiler(self.args.compiler, ['default'])
 
   def test_specs(self):
-    return [self.config.job_spec(['src/php/bin/run_tests.sh'], None,
+    return [self.config.job_spec(['src/php/bin/run_tests.sh'],
                                   environ=_FORCE_ENVIRON_FOR_WRAPPERS)]
 
   def pre_build_steps(self):
@@ -401,10 +509,10 @@ class Php7Language(object):
     return []
 
   def build_steps(self):
-    return [['tools/run_tests/build_php.sh']]
+    return [['tools/run_tests/helper_scripts/build_php.sh']]
 
   def post_tests_steps(self):
-    return [['tools/run_tests/post_tests_php.sh']]
+    return [['tools/run_tests/helper_scripts/post_tests_php.sh']]
 
   def makefile_name(self):
     return 'Makefile'
@@ -435,8 +543,8 @@ class PythonLanguage(object):
     return [self.config.job_spec(
         config.run,
         timeout_seconds=5*60,
-        environ=dict(environment.items() +
-                     [('GRPC_PYTHON_TESTRUNNER_FILTER', suite_name)]),
+        environ=dict(list(environment.items()) +
+                     [('GRPC_PYTHON_TESTRUNNER_FILTER', str(suite_name))]),
         shortname='%s.test.%s' % (config.name, suite_name),)
         for suite_name in tests_json
         for config in self.pythons]
@@ -460,41 +568,50 @@ class PythonLanguage(object):
     return 'Makefile'
 
   def dockerfile_dir(self):
-    return 'tools/dockerfile/test/python_jessie_%s' % _docker_arch_suffix(self.args.arch)
+    return 'tools/dockerfile/test/python_%s_%s' % (self.python_manager_name(), _docker_arch_suffix(self.args.arch))
+
+  def python_manager_name(self):
+    return 'pyenv' if self.args.compiler in ['python3.5', 'python3.6'] else 'jessie'
 
   def _get_pythons(self, args):
     if args.arch == 'x86':
       bits = '32'
     else:
       bits = '64'
+
     if os.name == 'nt':
       shell = ['bash']
-      builder = [os.path.abspath('tools/run_tests/build_python_msys2.sh')]
+      builder = [os.path.abspath('tools/run_tests/helper_scripts/build_python_msys2.sh')]
       builder_prefix_arguments = ['MINGW{}'.format(bits)]
       venv_relative_python = ['Scripts/python.exe']
       toolchain = ['mingw32']
-      python_pattern_function = lambda major, minor, bits: (
-          '/c/Python{major}{minor}/python.exe'.format(major=major, minor=minor, bits=bits)
-	  if bits == '64' else
-	  '/c/Python{major}{minor}_{bits}bits/python.exe'.format(
-              major=major, minor=minor, bits=bits))
     else:
       shell = []
-      builder = [os.path.abspath('tools/run_tests/build_python.sh')]
+      builder = [os.path.abspath('tools/run_tests/helper_scripts/build_python.sh')]
       builder_prefix_arguments = []
       venv_relative_python = ['bin/python']
       toolchain = ['unix']
-      # Bit-ness is handled by the test machine's environment
-      python_pattern_function = lambda major, minor, bits: 'python{major}.{minor}'.format(major=major, minor=minor)
-    runner = [os.path.abspath('tools/run_tests/run_python.sh')]
-    python_config_generator = lambda name, major, minor, bits: PythonConfig(
-        name,
-        shell + builder + builder_prefix_arguments
-	    + [python_pattern_function(major=major, minor=minor, bits=bits)]
-	    + [name] + venv_relative_python + toolchain,
-        shell + runner + [os.path.join(name, venv_relative_python[0])])
-    python27_config = python_config_generator(name='py27', major='2', minor='7', bits=bits)
-    python34_config = python_config_generator(name='py34', major='3', minor='4', bits=bits)
+
+    runner = [os.path.abspath('tools/run_tests/helper_scripts/run_python.sh')]
+    config_vars = _PythonConfigVars(shell, builder, builder_prefix_arguments,
+                              venv_relative_python, toolchain, runner)
+    python27_config = _python_config_generator(name='py27', major='2',
+                                               minor='7', bits=bits,
+                                               config_vars=config_vars)
+    python34_config = _python_config_generator(name='py34', major='3',
+                                               minor='4', bits=bits,
+                                               config_vars=config_vars)
+    python35_config = _python_config_generator(name='py35', major='3',
+                                               minor='5', bits=bits,
+                                               config_vars=config_vars)
+    python36_config = _python_config_generator(name='py36', major='3',
+                                               minor='6', bits=bits,
+                                               config_vars=config_vars)
+    pypy27_config = _pypy_config_generator(name='pypy', major='2',
+                                           config_vars=config_vars)
+    pypy32_config = _pypy_config_generator(name='pypy3', major='3',
+                                           config_vars=config_vars)
+
     if args.compiler == 'default':
       if os.name == 'nt':
         return (python27_config,)
@@ -504,6 +621,14 @@ class PythonLanguage(object):
       return (python27_config,)
     elif args.compiler == 'python3.4':
       return (python34_config,)
+    elif args.compiler == 'python3.5':
+      return (python35_config,)
+    elif args.compiler == 'python3.6':
+      return (python36_config,)
+    elif args.compiler == 'pypy':
+      return (pypy27_config,)
+    elif args.compiler == 'pypy3':
+      return (pypy32_config,)
     else:
       raise Exception('Compiler %s not supported.' % args.compiler)
 
@@ -519,12 +644,12 @@ class RubyLanguage(object):
     _check_compiler(self.args.compiler, ['default'])
 
   def test_specs(self):
-    return [self.config.job_spec(['tools/run_tests/run_ruby.sh'],
+    return [self.config.job_spec(['tools/run_tests/helper_scripts/run_ruby.sh'],
                                  timeout_seconds=10*60,
                                  environ=_FORCE_ENVIRON_FOR_WRAPPERS)]
 
   def pre_build_steps(self):
-    return [['tools/run_tests/pre_build_ruby.sh']]
+    return [['tools/run_tests/helper_scripts/pre_build_ruby.sh']]
 
   def make_targets(self):
     return []
@@ -533,10 +658,10 @@ class RubyLanguage(object):
     return []
 
   def build_steps(self):
-    return [['tools/run_tests/build_ruby.sh']]
+    return [['tools/run_tests/helper_scripts/build_ruby.sh']]
 
   def post_tests_steps(self):
-    return [['tools/run_tests/post_tests_ruby.sh']]
+    return [['tools/run_tests/helper_scripts/post_tests_ruby.sh']]
 
   def makefile_name(self):
     return 'Makefile'
@@ -610,7 +735,6 @@ class CSharpLanguage(object):
         for test in tests_by_assembly[assembly]:
           cmdline = runtime_cmd + [assembly_file, '--test=%s' % test] + nunit_args
           specs.append(self.config.job_spec(cmdline,
-                                            None,
                                             shortname='csharp.%s' % test,
                                             environ=_FORCE_ENVIRON_FOR_WRAPPERS))
       else:
@@ -628,7 +752,6 @@ class CSharpLanguage(object):
         # to prevent problems with registering the profiler.
         run_exclusive = 1000000
         specs.append(self.config.job_spec(cmdline,
-                                          None,
                                           shortname='csharp.coverage.%s' % assembly,
                                           cpu_cost=run_exclusive,
                                           environ=_FORCE_ENVIRON_FOR_WRAPPERS))
@@ -636,9 +759,9 @@ class CSharpLanguage(object):
 
   def pre_build_steps(self):
     if self.platform == 'windows':
-      return [['tools\\run_tests\\pre_build_csharp.bat']]
+      return [['tools\\run_tests\\helper_scripts\\pre_build_csharp.bat']]
     else:
-      return [['tools/run_tests/pre_build_csharp.sh']]
+      return [['tools/run_tests/helper_scripts/pre_build_csharp.sh']]
 
   def make_targets(self):
     return ['grpc_csharp_ext']
@@ -649,22 +772,22 @@ class CSharpLanguage(object):
   def build_steps(self):
     if self.args.compiler == 'coreclr':
       if self.platform == 'windows':
-        return [['tools\\run_tests\\build_csharp_coreclr.bat']]
+        return [['tools\\run_tests\\helper_scripts\\build_csharp_coreclr.bat']]
       else:
-        return [['tools/run_tests/build_csharp_coreclr.sh']]
+        return [['tools/run_tests/helper_scripts/build_csharp_coreclr.sh']]
     else:
       if self.platform == 'windows':
         return [[_windows_build_bat(self.args.compiler),
                  'src/csharp/Grpc.sln',
                  '/p:Configuration=%s' % _MSBUILD_CONFIG[self.config.build_config]]]
       else:
-        return [['tools/run_tests/build_csharp.sh']]
+        return [['tools/run_tests/helper_scripts/build_csharp.sh']]
 
   def post_tests_steps(self):
     if self.platform == 'windows':
-      return [['tools\\run_tests\\post_tests_csharp.bat']]
+      return [['tools\\run_tests\\helper_scripts\\post_tests_csharp.bat']]
     else:
-      return [['tools/run_tests/post_tests_csharp.sh']]
+      return [['tools/run_tests/helper_scripts/post_tests_csharp.sh']]
 
   def makefile_name(self):
     return 'Makefile'
@@ -687,11 +810,11 @@ class ObjCLanguage(object):
   def test_specs(self):
     return [
         self.config.job_spec(['src/objective-c/tests/run_tests.sh'],
-                              timeout_seconds=None,
+                              timeout_seconds=60*60,
                               shortname='objc-tests',
                               environ=_FORCE_ENVIRON_FOR_WRAPPERS),
         self.config.job_spec(['src/objective-c/tests/build_example_test.sh'],
-                              timeout_seconds=15*60,
+                              timeout_seconds=30*60,
                               shortname='objc-examples-build',
                               environ=_FORCE_ENVIRON_FOR_WRAPPERS),
     ]
@@ -731,8 +854,12 @@ class Sanity(object):
   def test_specs(self):
     import yaml
     with open('tools/run_tests/sanity/sanity_tests.yaml', 'r') as f:
+      environ={'TEST': 'true'}
+      if _is_use_docker_child():
+        environ['CLANG_FORMAT_SKIP_DOCKER'] = 'true'
       return [self.config.job_spec(cmd['script'].split(),
-                                   timeout_seconds=None, environ={'TEST': 'true'},
+                                   timeout_seconds=30*60,
+                                   environ=environ,
                                    cpu_cost=cmd.get('cpu_cost', 1))
               for cmd in yaml.load(f)]
 
@@ -760,9 +887,56 @@ class Sanity(object):
   def __str__(self):
     return 'sanity'
 
+class NodeExpressLanguage(object):
+  """Dummy Node express test target to enable running express performance
+  benchmarks"""
+
+  def __init__(self):
+    self.platform = platform_string()
+
+  def configure(self, config, args):
+    self.config = config
+    self.args = args
+    _check_compiler(self.args.compiler, ['default', 'node0.12',
+                                         'node4', 'node5', 'node6'])
+    if self.args.compiler == 'default':
+      self.node_version = '4'
+    else:
+      # Take off the word "node"
+      self.node_version = self.args.compiler[4:]
+
+  def test_specs(self):
+    return []
+
+  def pre_build_steps(self):
+    if self.platform == 'windows':
+      return [['tools\\run_tests\\helper_scripts\\pre_build_node.bat']]
+    else:
+      return [['tools/run_tests/helper_scripts/pre_build_node.sh', self.node_version]]
+
+  def make_targets(self):
+    return []
+
+  def make_options(self):
+    return []
+
+  def build_steps(self):
+    return []
+
+  def post_tests_steps(self):
+    return []
+
+  def makefile_name(self):
+    return 'Makefile'
+
+  def dockerfile_dir(self):
+    return 'tools/dockerfile/test/node_jessie_%s' % _docker_arch_suffix(self.args.arch)
+
+  def __str__(self):
+    return 'node_express'
 
 # different configurations we can run under
-with open('tools/run_tests/configs.json') as f:
+with open('tools/run_tests/generated/configs.json') as f:
   _CONFIGS = dict((cfg['config'], Config(**cfg)) for cfg in ast.literal_eval(f.read()))
 
 
@@ -770,6 +944,7 @@ _LANGUAGES = {
     'c++': CLanguage('cxx', 'c++'),
     'c': CLanguage('c', 'c'),
     'node': NodeLanguage(),
+    'node_express': NodeExpressLanguage(),
     'php': PhpLanguage(),
     'php7': Php7Language(),
     'python': PythonLanguage(),
@@ -794,7 +969,7 @@ def _windows_arch_option(arch):
   elif arch == 'x64':
     return '/p:Platform=x64'
   else:
-    print 'Architecture %s not supported.' % arch
+    print('Architecture %s not supported.' % arch)
     sys.exit(1)
 
 
@@ -812,11 +987,11 @@ def _check_arch_option(arch):
     elif runtime_arch == '32bit' and arch == 'x86':
       return
     else:
-      print 'Architecture %s does not match current runtime architecture.' % arch
+      print('Architecture %s does not match current runtime architecture.' % arch)
       sys.exit(1)
   else:
     if args.arch != 'default':
-      print 'Architecture %s not supported on current platform.' % args.arch
+      print('Architecture %s not supported on current platform.' % args.arch)
       sys.exit(1)
 
 
@@ -830,7 +1005,7 @@ def _windows_build_bat(compiler):
   elif compiler == 'vs2010':
     return 'vsprojects\\build_vs2010.bat'
   else:
-    print 'Compiler %s not supported.' % compiler
+    print('Compiler %s not supported.' % compiler)
     sys.exit(1)
 
 
@@ -844,7 +1019,7 @@ def _windows_toolset_option(compiler):
   elif compiler == 'vs2010':
     return '/p:PlatformToolset=v100'
   else:
-    print 'Compiler %s not supported.' % compiler
+    print('Compiler %s not supported.' % compiler)
     sys.exit(1)
 
 
@@ -855,7 +1030,7 @@ def _docker_arch_suffix(arch):
   elif arch == 'x86':
     return 'x86'
   else:
-    print 'Architecture %s not supported with current settings.' % arch
+    print('Architecture %s not supported with current settings.' % arch)
     sys.exit(1)
 
 
@@ -878,6 +1053,7 @@ def runs_per_test_type(arg_str):
     except:
         msg = '\'{}\' is not a positive integer or \'inf\''.format(arg_str)
         raise argparse.ArgumentTypeError(msg)
+
 
 # parse command line
 argp = argparse.ArgumentParser(description='Run grpc tests.')
@@ -929,14 +1105,19 @@ argp.add_argument('--arch',
                   help='Selects architecture to target. For some platforms "default" is the only supported choice.')
 argp.add_argument('--compiler',
                   choices=['default',
-                           'gcc4.4', 'gcc4.6', 'gcc4.9', 'gcc5.3',
+                           'gcc4.4', 'gcc4.6', 'gcc4.8', 'gcc4.9', 'gcc5.3',
                            'clang3.4', 'clang3.5', 'clang3.6', 'clang3.7',
                            'vs2010', 'vs2013', 'vs2015',
-                           'python2.7', 'python3.4',
+                           'python2.7', 'python3.4', 'python3.5', 'python3.6', 'pypy', 'pypy3',
                            'node0.12', 'node4', 'node5', 'node6', 'node7',
+                           'electron1.3',
                            'coreclr'],
                   default='default',
                   help='Selects compiler to use. Allowed values depend on the platform and language.')
+argp.add_argument('--iomgr_platform',
+                  choices=['native', 'uv'],
+                  default='native',
+                  help='Selects iomgr platform to build on')
 argp.add_argument('--build_only',
                   default=False,
                   action='store_const',
@@ -952,6 +1133,12 @@ argp.add_argument('-x', '--xml_report', default=None, type=str,
         help='Generates a JUnit-compatible XML report')
 argp.add_argument('--report_suite_name', default='tests', type=str,
         help='Test suite name to use in generated JUnit XML report')
+argp.add_argument('--quiet_success',
+                  default=False,
+                  action='store_const',
+                  const=True,
+                  help='Dont print anything when a test passes. Passing tests also will not be reported in XML report. ' +
+                       'Useful when running many iterations of each test (argument -n).')
 argp.add_argument('--force_default_poller', default=False, action='store_const', const=True,
                   help='Dont try to iterate over many polling strategies when they exist')
 args = argp.parse_args()
@@ -973,7 +1160,7 @@ for spec in args.update_submodules:
     branch = spec[1]
   cwd = 'third_party/%s' % submodule
   def git(cmd, cwd=cwd):
-    print 'in %s: git %s' % (cwd, cmd)
+    print('in %s: git %s' % (cwd, cmd))
     subprocess.check_call('git %s' % cmd, cwd=cwd, shell=True)
   git('fetch')
   git('checkout %s' % branch)
@@ -984,8 +1171,8 @@ if need_to_regenerate_projects:
   if jobset.platform_string() == 'linux':
     subprocess.check_call('tools/buildgen/generate_projects.sh', shell=True)
   else:
-    print 'WARNING: may need to regenerate projects, but since we are not on'
-    print '         Linux this step is being skipped. Compilation MAY fail.'
+    print('WARNING: may need to regenerate projects, but since we are not on')
+    print('         Linux this step is being skipped. Compilation MAY fail.')
 
 
 # grab config
@@ -1012,18 +1199,18 @@ for l in languages:
 language_make_options=[]
 if any(language.make_options() for language in languages):
   if not 'gcov' in args.config and len(languages) != 1:
-    print 'languages with custom make options cannot be built simultaneously with other languages'
+    print('languages with custom make options cannot be built simultaneously with other languages')
     sys.exit(1)
   else:
     language_make_options = next(iter(languages)).make_options()
 
 if args.use_docker:
   if not args.travis:
-    print 'Seen --use_docker flag, will run tests under docker.'
-    print
-    print 'IMPORTANT: The changes you are testing need to be locally committed'
-    print 'because only the committed changes in the current branch will be'
-    print 'copied to the docker environment.'
+    print('Seen --use_docker flag, will run tests under docker.')
+    print('')
+    print('IMPORTANT: The changes you are testing need to be locally committed')
+    print('because only the committed changes in the current branch will be')
+    print('copied to the docker environment.')
     time.sleep(5)
 
   dockerfile_dirs = set([l.dockerfile_dir() for l in languages])
@@ -1107,7 +1294,7 @@ build_steps = list(set(
                    for l in languages
                    for cmdline in l.pre_build_steps()))
 if make_targets:
-  make_commands = itertools.chain.from_iterable(make_jobspec(build_config, list(targets), makefile) for (makefile, targets) in make_targets.iteritems())
+  make_commands = itertools.chain.from_iterable(make_jobspec(build_config, list(targets), makefile) for (makefile, targets) in make_targets.items())
   build_steps.extend(set(make_commands))
 build_steps.extend(set(
                    jobset.JobSpec(cmdline, environ=build_step_environ(build_config), timeout_seconds=None)
@@ -1124,25 +1311,13 @@ forever = args.forever
 
 def _shut_down_legacy_server(legacy_server_port):
   try:
-    version = int(urllib2.urlopen(
+    version = int(urllib.request.urlopen(
         'http://localhost:%d/version_number' % legacy_server_port,
         timeout=10).read())
   except:
     pass
   else:
-    urllib2.urlopen(
-        'http://localhost:%d/quitquitquit' % legacy_server_port).read()
-
-
-def _shut_down_legacy_server(legacy_server_port):
-  try:
-    version = int(urllib2.urlopen(
-        'http://localhost:%d/version_number' % legacy_server_port,
-        timeout=10).read())
-  except:
-    pass
-  else:
-    urllib2.urlopen(
+    urllib.request.urlopen(
         'http://localhost:%d/quitquitquit' % legacy_server_port).read()
 
 
@@ -1152,30 +1327,30 @@ def _start_port_server(port_server_port):
   # if not running ==> start a new one
   # otherwise, leave it up
   try:
-    version = int(urllib2.urlopen(
+    version = int(urllib.request.urlopen(
         'http://localhost:%d/version_number' % port_server_port,
         timeout=10).read())
-    print 'detected port server running version %d' % version
+    print('detected port server running version %d' % version)
     running = True
   except Exception as e:
-    print 'failed to detect port server: %s' % sys.exc_info()[0]
-    print e.strerror
+    print('failed to detect port server: %s' % sys.exc_info()[0])
+    print(e.strerror)
     running = False
   if running:
     current_version = int(subprocess.check_output(
-        [sys.executable, os.path.abspath('tools/run_tests/port_server.py'),
+        [sys.executable, os.path.abspath('tools/run_tests/python_utils/port_server.py'),
          'dump_version']))
-    print 'my port server is version %d' % current_version
+    print('my port server is version %d' % current_version)
     running = (version >= current_version)
     if not running:
-      print 'port_server version mismatch: killing the old one'
-      urllib2.urlopen('http://localhost:%d/quitquitquit' % port_server_port).read()
+      print('port_server version mismatch: killing the old one')
+      urllib.request.urlopen('http://localhost:%d/quitquitquit' % port_server_port).read()
       time.sleep(1)
   if not running:
     fd, logfile = tempfile.mkstemp()
     os.close(fd)
-    print 'starting port_server, with log file %s' % logfile
-    args = [sys.executable, os.path.abspath('tools/run_tests/port_server.py'),
+    print('starting port_server, with log file %s' % logfile)
+    args = [sys.executable, os.path.abspath('tools/run_tests/python_utils/port_server.py'),
             '-p', '%d' % port_server_port, '-l', logfile]
     env = dict(os.environ)
     env['BUILD_ID'] = 'pleaseDontKillMeJenkins'
@@ -1200,34 +1375,34 @@ def _start_port_server(port_server_port):
     waits = 0
     while True:
       if waits > 10:
-        print 'killing port server due to excessive start up waits'
+        print('killing port server due to excessive start up waits')
         port_server.kill()
       if port_server.poll() is not None:
-        print 'port_server failed to start'
+        print('port_server failed to start')
         # try one final time: maybe another build managed to start one
         time.sleep(1)
         try:
-          urllib2.urlopen('http://localhost:%d/get' % port_server_port,
+          urllib.request.urlopen('http://localhost:%d/get' % port_server_port,
                           timeout=1).read()
-          print 'last ditch attempt to contact port server succeeded'
+          print('last ditch attempt to contact port server succeeded')
           break
         except:
           traceback.print_exc()
           port_log = open(logfile, 'r').read()
-          print port_log
+          print(port_log)
           sys.exit(1)
       try:
-        urllib2.urlopen('http://localhost:%d/get' % port_server_port,
+        urllib.request.urlopen('http://localhost:%d/get' % port_server_port,
                         timeout=1).read()
-        print 'port server is up and ready'
+        print('port server is up and ready')
         break
       except socket.timeout:
-        print 'waiting for port_server: timeout'
+        print('waiting for port_server: timeout')
         traceback.print_exc();
         time.sleep(1)
         waits += 1
-      except urllib2.URLError:
-        print 'waiting for port_server: urlerror'
+      except urllib.error.URLError:
+        print('waiting for port_server: urlerror')
         traceback.print_exc();
         time.sleep(1)
         waits += 1
@@ -1281,7 +1456,7 @@ def _build_and_run(
     return []
 
   # start antagonists
-  antagonists = [subprocess.Popen(['tools/run_tests/antagonist.py'])
+  antagonists = [subprocess.Popen(['tools/run_tests/python_utils/antagonist.py'])
                  for _ in range(0, args.antagonists)]
   port_server_port = 32766
   _start_port_server(port_server_port)
@@ -1311,20 +1486,24 @@ def _build_and_run(
                      else itertools.repeat(massaged_one_run, runs_per_test))
     all_runs = itertools.chain.from_iterable(runs_sequence)
 
+    if args.quiet_success:
+      jobset.message('START', 'Running tests quietly, only failing tests will be reported', do_newline=True)
     num_test_failures, resultset = jobset.run(
         all_runs, check_cancelled, newline_on_success=newline_on_success,
         travis=args.travis, infinite_runs=infinite_runs, maxjobs=args.jobs,
         stop_on_failure=args.stop_on_failure,
-        add_env={'GRPC_TEST_PORT_SERVER': 'localhost:%d' % port_server_port})
+        add_env={'GRPC_TEST_PORT_SERVER': 'localhost:%d' % port_server_port},
+        quiet_success=args.quiet_success)
     if resultset:
       for k, v in sorted(resultset.items()):
         num_runs, num_failures = _calculate_num_runs_failures(v)
-        if num_failures == num_runs:  # what about infinite_runs???
-          jobset.message('FAILED', k, do_newline=True)
-        elif num_failures > 0:
-          jobset.message(
-              'FLAKE', '%s [%d/%d runs flaked]' % (k, num_failures, num_runs),
-              do_newline=True)
+        if num_failures > 0:
+          if num_failures == num_runs:  # what about infinite_runs???
+            jobset.message('FAILED', k, do_newline=True)
+          else:
+            jobset.message(
+                'FLAKE', '%s [%d/%d runs flaked]' % (k, num_failures, num_runs),
+                do_newline=True)
   finally:
     for antagonist in antagonists:
       antagonist.kill()

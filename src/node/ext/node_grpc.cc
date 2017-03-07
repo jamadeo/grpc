@@ -31,7 +31,7 @@
  *
  */
 
-#include <list>
+#include <queue>
 
 #include <node.h>
 #include <nan.h>
@@ -42,6 +42,13 @@
 #include "grpc/support/log.h"
 #include "grpc/support/time.h"
 
+// TODO(murgatroid99): Remove this when the endpoint API becomes public
+#ifdef GRPC_UV
+extern "C" {
+#include "src/core/lib/iomgr/pollset_uv.h"
+}
+#endif
+
 #include "call.h"
 #include "call_credentials.h"
 #include "channel.h"
@@ -50,6 +57,7 @@
 #include "completion_queue_async_worker.h"
 #include "server_credentials.h"
 #include "timeval.h"
+#include "completion_queue.h"
 
 using v8::FunctionTemplate;
 using v8::Local;
@@ -66,7 +74,7 @@ typedef struct log_args {
 
 typedef struct logger_state {
   Nan::Callback *callback;
-  std::list<log_args *> *pending_args;
+  std::queue<log_args *> *pending_args;
   uv_mutex_t mutex;
   uv_async_t async;
   // Indicates that a logger has been set
@@ -334,14 +342,14 @@ NAN_METHOD(SetDefaultRootsPem) {
 
 NAUV_WORK_CB(LogMessagesCallback) {
   Nan::HandleScope scope;
-  std::list<log_args *> args;
+  std::queue<log_args *> args;
   uv_mutex_lock(&grpc_logger_state.mutex);
-  args.splice(args.begin(), *grpc_logger_state.pending_args);
+  grpc_logger_state.pending_args->swap(args);
   uv_mutex_unlock(&grpc_logger_state.mutex);
   /* Call the callback with each log message */
   while (!args.empty()) {
     log_args *arg = args.front();
-    args.pop_front();
+    args.pop();
     Local<Value> file = Nan::New(arg->core_args.file).ToLocalChecked();
     Local<Value> line = Nan::New<Uint32, uint32_t>(arg->core_args.line);
     Local<Value> severity = Nan::New(
@@ -368,7 +376,7 @@ void node_log_func(gpr_log_func_args *args) {
   args_copy->timestamp = gpr_now(GPR_CLOCK_REALTIME);
 
   uv_mutex_lock(&grpc_logger_state.mutex);
-  grpc_logger_state.pending_args->push_back(args_copy);
+  grpc_logger_state.pending_args->push(args_copy);
   uv_mutex_unlock(&grpc_logger_state.mutex);
 
   uv_async_send(&grpc_logger_state.async);
@@ -376,7 +384,7 @@ void node_log_func(gpr_log_func_args *args) {
 
 void init_logger() {
   memset(&grpc_logger_state, 0, sizeof(logger_state));
-  grpc_logger_state.pending_args = new std::list<log_args *>();
+  grpc_logger_state.pending_args = new std::queue<log_args *>();
   uv_mutex_init(&grpc_logger_state.mutex);
   uv_async_init(uv_default_loop(),
                 &grpc_logger_state.async,
@@ -428,13 +436,18 @@ void init(Local<Object> exports) {
   InitWriteFlags(exports);
   InitLogConstants(exports);
 
+#ifdef GRPC_UV
+  grpc_pollset_work_run_loop = 0;
+#endif
+
   grpc::node::Call::Init(exports);
   grpc::node::CallCredentials::Init(exports);
   grpc::node::Channel::Init(exports);
   grpc::node::ChannelCredentials::Init(exports);
   grpc::node::Server::Init(exports);
-  grpc::node::CompletionQueueAsyncWorker::Init(exports);
   grpc::node::ServerCredentials::Init(exports);
+
+  grpc::node::CompletionQueueInit(exports);
 
   // Attach a few utility functions directly to the module
   Nan::Set(exports, Nan::New("metadataKeyIsLegal").ToLocalChecked(),

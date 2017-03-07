@@ -186,7 +186,11 @@ typedef enum { NONE, SELF_SIGNED, SIGNED, BAD_CERT_PAIR } certtype;
     grpc_channel_args *new_client_args =                                     \
         grpc_channel_args_copy_and_add(client_args, &ssl_name_override, 1);  \
     chttp2_init_client_secure_fullstack(f, new_client_args, ssl_creds);      \
-    grpc_channel_args_destroy(new_client_args);                              \
+    {                                                                        \
+      grpc_exec_ctx exec_ctx = GRPC_EXEC_CTX_INIT;                           \
+      grpc_channel_args_destroy(&exec_ctx, new_client_args);                 \
+      grpc_exec_ctx_finish(&exec_ctx);                                       \
+    }                                                                        \
   }
 
 CLIENT_INIT(NONE)
@@ -203,7 +207,8 @@ typedef enum { SUCCESS, FAIL } test_result;
   {                                                                       \
     {TEST_NAME(request_type, cert_type, result),                          \
      FEATURE_MASK_SUPPORTS_DELAYED_CONNECTION |                           \
-         FEATURE_MASK_SUPPORTS_PER_CALL_CREDENTIALS,                      \
+         FEATURE_MASK_SUPPORTS_PER_CALL_CREDENTIALS |                     \
+         FEATURE_MASK_SUPPORTS_CLIENT_CHANNEL,                            \
      chttp2_create_fixture_secure_fullstack, CLIENT_INIT_NAME(cert_type), \
      SERVER_INIT_NAME(request_type), chttp2_tear_down_secure_fullstack},  \
         result                                                            \
@@ -331,7 +336,7 @@ static void simple_request_body(grpc_end2end_test_fixture f,
   error = grpc_call_start_batch(c, ops, (size_t)(op - ops), tag(1), NULL);
   GPR_ASSERT(GRPC_CALL_OK == error);
 
-  cq_expect_completion(cqv, tag(1), expected_result == SUCCESS);
+  CQ_EXPECT_COMPLETION(cqv, tag(1), expected_result == SUCCESS);
   cq_verify(cqv);
 
   grpc_call_destroy(c);
